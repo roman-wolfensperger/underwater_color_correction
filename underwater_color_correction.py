@@ -23,27 +23,41 @@ class UnderwaterColorCorrector:
     """
     
     def __init__(self, input_path: str, output_path: str, 
-                 intensity: float = 1.0, contrast: float = 2.0):
+                 intensity: float = 1.0, contrast: float = 2.0,
+                 color_mask: str = 'all'):
         """
         Initialize the color corrector.
         
         Args:
-            input_path: Path to input MP4 video
-            output_path: Path for output corrected video
-            intensity: Correction intensity (0.0-2.0), default 1.0, 0.0 = no correction
-            contrast: Contrast enhancement level (0.0-4.0), default 2.0
+            input_path: Path to input MP4 video or JPEG image
+            output_path: Path for output corrected video or JPEG image
+            intensity: Correction intensity (-2.0 to 2.0), default 1.0
+                      Negative values remove red, positive values add red
+            contrast: Contrast enhancement level (-2.0 to 4.0), default 2.0
+                      Negative values reduce contrast
+            color_mask: Target colors for red enhancement ('all', 'blue', 'green', 'cyan')
         """
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
-        self.intensity = np.clip(intensity, 0.0, 2.0)
-        self.contrast = np.clip(contrast, 0.0, 4.0)
+        self.intensity = np.clip(intensity, -2.0, 2.0)
+        self.contrast = np.clip(contrast, -2.0, 4.0)
+        self.color_mask = color_mask.lower()
+        
+        # Validate color mask
+        valid_masks = ['all', 'blue', 'green', 'cyan', 'blue-green']
+        if self.color_mask not in valid_masks:
+            self.color_mask = 'all'
         
         # Validate input file
         if not self.input_path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
         
-        if self.input_path.suffix.lower() != '.mp4':
-            raise ValueError("Input file must be MP4 format")
+        # Check if it's an image or video
+        self.is_image = self.input_path.suffix.lower() in ['.jpg', '.jpeg', '.png']
+        self.is_video = self.input_path.suffix.lower() == '.mp4'
+        
+        if not self.is_image and not self.is_video:
+            raise ValueError("Input file must be MP4, JPG, JPEG, or PNG format")
     
     def apply_white_balance(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -75,6 +89,54 @@ class UnderwaterColorCorrector:
         balanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
         return balanced
     
+    def create_color_mask(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Create a mask to selectively target specific colors for red enhancement.
+        
+        Args:
+            frame: Input BGR frame
+            
+        Returns:
+            Mask (0-1 float) where 1 = apply full correction, 0 = no correction
+        """
+        if self.color_mask == 'all':
+            # Apply to all pixels
+            return np.ones(frame.shape[:2], dtype=np.float32)
+        
+        # Convert to HSV for better color selection
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        
+        # Create mask based on selected color range
+        if self.color_mask == 'blue':
+            # Blue hues (around 100-130 in OpenCV's 0-180 range)
+            mask1 = cv2.inRange(h, 90, 130)
+            # Also catch blue-violet
+            mask2 = cv2.inRange(h, 100, 140)
+            mask = cv2.bitwise_or(mask1, mask2)
+            
+        elif self.color_mask == 'green':
+            # Green hues (around 40-80)
+            mask = cv2.inRange(h, 35, 85)
+            
+        elif self.color_mask == 'cyan' or self.color_mask == 'blue-green':
+            # Cyan/turquoise hues (between green and blue, 80-100)
+            mask = cv2.inRange(h, 75, 105)
+        else:
+            mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
+        
+        # Require minimum saturation to avoid affecting grays/whites
+        sat_mask = cv2.inRange(s, 30, 255)
+        mask = cv2.bitwise_and(mask, sat_mask)
+        
+        # Smooth the mask to avoid hard edges
+        mask = cv2.GaussianBlur(mask, (15, 15), 0)
+        
+        # Convert to 0-1 float range
+        mask_float = mask.astype(np.float32) / 255.0
+        
+        return mask_float
+    
     def enhance_red_channel(self, frame: np.ndarray) -> np.ndarray:
         """
         Enhance red channel to compensate for water absorption.
@@ -90,47 +152,83 @@ class UnderwaterColorCorrector:
         if self.intensity == 0.0:
             return frame
         
+        # Create color mask for selective enhancement
+        mask = self.create_color_mask(frame)
+        
         # Split channels
         b, g, r = cv2.split(frame)
         
-        # Enhance red channel (water absorbs red first)
-        r_enhanced = cv2.convertScaleAbs(r, alpha=1.0 + (0.3 * self.intensity), beta=10 * self.intensity)
+        # Calculate enhancements
+        r_factor = 1.0 + (0.3 * self.intensity)
+        r_offset = 10 * self.intensity
+        b_factor = 1.0 - (0.1 * self.intensity)
+        b_offset = -5 * self.intensity
+        g_factor = 1.0 - (0.05 * self.intensity)
+        g_offset = -3 * self.intensity
         
-        # Slightly reduce blue/green dominance
-        b_reduced = cv2.convertScaleAbs(b, alpha=1.0 - (0.1 * self.intensity), beta=-5 * self.intensity)
-        g_reduced = cv2.convertScaleAbs(g, alpha=1.0 - (0.05 * self.intensity), beta=-3 * self.intensity)
+        # Apply enhancements
+        r_enhanced = cv2.convertScaleAbs(r, alpha=r_factor, beta=r_offset)
+        b_reduced = cv2.convertScaleAbs(b, alpha=b_factor, beta=b_offset)
+        g_reduced = cv2.convertScaleAbs(g, alpha=g_factor, beta=g_offset)
         
-        # Merge channels back
-        enhanced = cv2.merge([b_reduced, g_reduced, r_enhanced])
-        return enhanced
+        # Blend based on mask
+        if self.color_mask != 'all':
+            # Expand mask to 3 channels
+            mask_3ch = cv2.merge([mask, mask, mask])
+            
+            # Original channels
+            original = cv2.merge([b, g, r])
+            
+            # Enhanced channels
+            enhanced = cv2.merge([b_reduced, g_reduced, r_enhanced])
+            
+            # Blend: original * (1 - mask) + enhanced * mask
+            result = (original * (1 - mask_3ch) + enhanced * mask_3ch).astype(np.uint8)
+            
+            return result
+        else:
+            # Apply to all pixels
+            enhanced = cv2.merge([b_reduced, g_reduced, r_enhanced])
+            return enhanced
     
     def apply_contrast_enhancement(self, frame: np.ndarray) -> np.ndarray:
         """
-        Enhance contrast using CLAHE (Contrast Limited Adaptive Histogram Equalization).
+        Enhance or reduce contrast using CLAHE or histogram adjustment.
         Improves visibility in low-contrast underwater scenes.
         
         Args:
             frame: Input BGR frame
             
         Returns:
-            Contrast-enhanced frame
+            Contrast-enhanced or reduced frame
         """
+        # If contrast is 0, return original frame
+        if self.contrast == 0.0:
+            return frame
+
         # Convert to LAB for luminance-only processing
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         
-        # Apply CLAHE to L channel with adjustable contrast parameter
-        clahe = cv2.createCLAHE(clipLimit=self.contrast, tileGridSize=(8, 8))
-        l_clahe = clahe.apply(l)
+        if self.contrast > 0:
+            # Positive contrast: Use CLAHE to enhance
+            clahe = cv2.createCLAHE(clipLimit=self.contrast, tileGridSize=(8, 8))
+            l_adjusted = clahe.apply(l)
+        else:
+            # Negative contrast: Reduce contrast by moving towards mean
+            mean_l = np.mean(l)
+            # Scale factor: -2.0 = move 100% towards mean, 0 = no change
+            factor = 1.0 + (self.contrast / 2.0)  # -2.0 -> 0.0, 0.0 -> 1.0
+            l_adjusted = ((l - mean_l) * factor + mean_l).astype(np.uint8)
         
         # Merge and convert back
-        lab_clahe = cv2.merge([l_clahe, a, b])
-        enhanced = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+        lab_adjusted = cv2.merge([l_adjusted, a, b])
+        enhanced = cv2.cvtColor(lab_adjusted, cv2.COLOR_LAB2BGR)
         return enhanced
     
     def apply_gamma_correction(self, frame: np.ndarray, gamma: float = 1.2) -> np.ndarray:
         """
-        Apply gamma correction to brighten mid-tones.
+        Apply gamma correction to brighten or darken mid-tones.
         Compensates for light loss at depth.
         
         Args:
@@ -145,10 +243,14 @@ class UnderwaterColorCorrector:
             return frame
         
         # Adjust gamma based on intensity (linear interpolation)
-        # intensity=0 -> gamma=1.0 (no change)
-        # intensity=1 -> gamma=1.2 (standard)
-        # intensity=2 -> gamma=1.4 (strong)
-        adjusted_gamma = 1.0 + ((gamma - 1.0) * self.intensity)
+        # For positive intensity: standard brightening
+        # For negative intensity: darken instead
+        if self.intensity > 0:
+            # intensity=1 -> gamma=1.2, intensity=2 -> gamma=1.4
+            adjusted_gamma = 1.0 + ((gamma - 1.0) * self.intensity)
+        else:
+            # intensity=-1 -> gamma=0.8, intensity=-2 -> gamma=0.6
+            adjusted_gamma = 1.0 + (0.2 * self.intensity)
         
         # Build lookup table
         inv_gamma = 1.0 / adjusted_gamma
@@ -190,19 +292,19 @@ class UnderwaterColorCorrector:
             return frame.copy()
         
         # Step 1: White balance correction (skipped if intensity=0)
-        if self.intensity > 0.0:
+        if self.intensity != 0.0:
             frame = self.apply_white_balance(frame)
         
         # Step 2: Enhance red channel (skipped if intensity=0)
-        if self.intensity > 0.0:
+        if self.intensity != 0.0:
             frame = self.enhance_red_channel(frame)
         
         # Step 3: Contrast enhancement (skipped if contrast=0)
-        if self.contrast > 0.0:
+        if self.contrast != 0.0:
             frame = self.apply_contrast_enhancement(frame)
         
         # Step 4: Gamma correction (skipped if intensity=0)
-        if self.intensity > 0.0:
+        if self.intensity != 0.0:
             frame = self.apply_gamma_correction(frame)
         
         # Step 5: Optional denoising (can be slow)
@@ -283,6 +385,40 @@ class UnderwaterColorCorrector:
         except subprocess.CalledProcessError:
             return False
     
+    def process_image(self, show_progress: bool = True, apply_denoise: bool = False):
+        """
+        Process a single image file with color correction.
+        
+        Args:
+            show_progress: Display progress information
+            apply_denoise: Whether to apply denoising
+        """
+        if show_progress:
+            print(f"Processing image: {self.input_path.name}")
+            print(f"Correction intensity: {self.intensity}")
+            print(f"Contrast enhancement: {self.contrast}")
+            print(f"Color mask: {self.color_mask}")
+            print(f"Denoising: {'Enabled' if apply_denoise else 'Disabled'}")
+            print("-" * 50)
+        
+        # Read image
+        frame = cv2.imread(str(self.input_path))
+        
+        if frame is None:
+            raise IOError(f"Cannot read image file: {self.input_path}")
+        
+        # Process frame
+        corrected_frame = self.process_frame(frame, apply_denoise)
+        
+        # Save image
+        success = cv2.imwrite(str(self.output_path), corrected_frame)
+        
+        if not success:
+            raise IOError(f"Failed to save image to: {self.output_path}")
+        
+        if show_progress:
+            print(f"Image saved to: {self.output_path}")
+    
     def process_video(self, apply_denoise: bool = False, 
                      show_progress: bool = True,
                      progress_callback: Optional[callable] = None):
@@ -298,6 +434,7 @@ class UnderwaterColorCorrector:
         if self.intensity == 0.0 and self.contrast == 0.0 and not apply_denoise:
             if show_progress:
                 print("No corrections needed (intensity=0, contrast=0)")
+                print(f"Color mask: {self.color_mask}")
                 print("Copying input file to output location...")
             
             # Check if FFmpeg is available for lossless copy
@@ -359,6 +496,7 @@ class UnderwaterColorCorrector:
             print(f"Total frames: {total_frames}")
             print(f"Correction intensity: {self.intensity}")
             print(f"Contrast enhancement: {self.contrast}")
+            print(f"Color mask: {self.color_mask}")
             print(f"Denoising: {'Enabled' if apply_denoise else 'Disabled'}")
             print(f"Audio preservation: {'Enabled' if has_ffmpeg else 'Disabled'}")
             print("-" * 50)
@@ -449,6 +587,9 @@ Examples:
   # With custom intensity and contrast
   python underwater_color_correction.py input.mp4 output.mp4 --intensity 1.5 --contrast 3.0
   
+  # With color mask targeting cyan colors
+  python underwater_color_correction.py input.mp4 output.mp4 --color-mask cyan
+  
   # Enable denoising (slower but cleaner)
   python underwater_color_correction.py input.mp4 output.mp4 --denoise
   
@@ -456,19 +597,26 @@ Note: FFmpeg must be installed to preserve audio track.
         """
     )
     
-    parser.add_argument('input', help='Input MP4 video file')
-    parser.add_argument('output', help='Output MP4 video file')
+    parser.add_argument('input', help='Input MP4 video or JPEG/JPG/PNG image file')
+    parser.add_argument('output', help='Output MP4 video or JPEG/JPG/PNG image file')
     parser.add_argument(
         '--intensity', 
         type=float, 
         default=1.0,
-        help='Correction intensity (0.0-2.0, default: 1.0, 0.0 = no correction)'
+        help='Correction intensity (-2.0 to 2.0, default: 1.0). Negative removes red, positive adds red'
     )
     parser.add_argument(
         '--contrast',
         type=float,
         default=2.0,
-        help='Contrast enhancement level (0.0-4.0, default: 2.0)'
+        help='Contrast enhancement (-2.0 to 4.0, default: 2.0). Negative reduces contrast'
+    )
+    parser.add_argument(
+        '--color-mask',
+        type=str,
+        default='all',
+        choices=['all', 'blue', 'green', 'cyan', 'blue-green'],
+        help='Target colors for red enhancement (default: all)'
     )
     parser.add_argument(
         '--denoise',
@@ -489,14 +637,21 @@ Note: FFmpeg must be installed to preserve audio track.
             args.input, 
             args.output, 
             args.intensity,
-            args.contrast
+            args.contrast,
+            args.color_mask
         )
         
-        # Process video
-        corrector.process_video(
-            apply_denoise=args.denoise,
-            show_progress=not args.quiet
-        )
+        # Process based on file type
+        if corrector.is_image:
+            corrector.process_image(
+                show_progress=not args.quiet,
+                apply_denoise=args.denoise
+            )
+        else:
+            corrector.process_video(
+                apply_denoise=args.denoise,
+                show_progress=not args.quiet
+            )
         
         return 0
         

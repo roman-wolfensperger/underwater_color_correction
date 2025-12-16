@@ -1,6 +1,6 @@
-# 🌊 Underwater Video Color Correction
+# 🌊 Underwater Video & Image Color Correction
 
-A Python-based tool for automatic color correction of underwater videos filmed with GoPro Hero 3 (and compatible cameras) using a red physical filter. This project provides both a command-line interface and a user-friendly GUI.
+A Python-based tool for automatic color correction of underwater videos and images filmed with GoPro Hero 3 (and compatible cameras) using a red physical filter. This project provides both a command-line interface and a user-friendly GUI.
 
 ## 📋 Table of Contents
 

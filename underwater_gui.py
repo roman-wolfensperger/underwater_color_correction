@@ -46,6 +46,7 @@ class UnderwaterColorCorrectionGUI:
         self.intensity_var = tk.DoubleVar(value=1.0)
         self.contrast_var = tk.DoubleVar(value=2.0)
         self.denoise_var = tk.BooleanVar(value=False)
+        self.color_mask_var = tk.StringVar(value='all')
         self.processing = False
         
         # Preview variables
@@ -63,6 +64,11 @@ class UnderwaterColorCorrectionGUI:
         # Bind slider updates to preview
         self.intensity_var.trace_add('write', self.on_parameter_change)
         self.contrast_var.trace_add('write', self.on_parameter_change)
+        self.color_mask_var.trace_add('write', self.on_parameter_change)
+        
+        # Bind window resize event
+        self.root.bind('<Configure>', self.on_window_resize)
+        self.resize_timer = None
     
     def center_window(self):
         """Center the window on the screen."""
@@ -189,7 +195,7 @@ class UnderwaterColorCorrectionGUI:
         
         self.intensity_slider = ttk.Scale(
             intensity_frame,
-            from_=0.0,
+            from_=-2.0,
             to=2.0,
             orient=tk.HORIZONTAL,
             variable=self.intensity_var,
@@ -197,10 +203,10 @@ class UnderwaterColorCorrectionGUI:
         )
         self.intensity_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         
-        self.intensity_label = ttk.Label(intensity_frame, text="1.00", width=4)
+        self.intensity_label = ttk.Label(intensity_frame, text="1.00", width=5)
         self.intensity_label.pack(side=tk.LEFT)
         
-        ttk.Label(params_frame, text="(0.0 = No Correction, 2.0 = Aggressive)", 
+        ttk.Label(params_frame, text="(Negative: Remove Red, Positive: Add Red)", 
                  font=('Helvetica', 8)).pack(anchor=tk.W)
         
         # Contrast slider
@@ -213,7 +219,7 @@ class UnderwaterColorCorrectionGUI:
         
         self.contrast_slider = ttk.Scale(
             contrast_frame,
-            from_=0.0,
+            from_=-2.0,
             to=4.0,
             orient=tk.HORIZONTAL,
             variable=self.contrast_var,
@@ -221,10 +227,37 @@ class UnderwaterColorCorrectionGUI:
         )
         self.contrast_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         
-        self.contrast_label = ttk.Label(contrast_frame, text="2.00", width=4)
+        self.contrast_label = ttk.Label(contrast_frame, text="2.00", width=5)
         self.contrast_label.pack(side=tk.LEFT)
         
-        ttk.Label(params_frame, text="(0.0 = No Enhancement, 4.0 = Maximum)", 
+        ttk.Label(params_frame, text="(Negative: Reduce Contrast, Positive: Enhance Contrast)", 
+                 font=('Helvetica', 8)).pack(anchor=tk.W)
+        
+        # Color mask selector
+        ttk.Label(params_frame, text="Target Colors for Red Enhancement:").pack(
+            anchor=tk.W, pady=(10, 0)
+        )
+        
+        color_mask_frame = ttk.Frame(params_frame)
+        color_mask_frame.pack(fill=tk.X, pady=5)
+        
+        color_options = [
+            ('All Colors', 'all'),
+            ('Blue Only', 'blue'),
+            ('Green Only', 'green'),
+            ('Cyan/Turquoise', 'cyan')
+        ]
+        
+        for i, (label, value) in enumerate(color_options):
+            rb = ttk.Radiobutton(
+                color_mask_frame,
+                text=label,
+                variable=self.color_mask_var,
+                value=value
+            )
+            rb.pack(anchor=tk.W, padx=20)
+        
+        ttk.Label(params_frame, text="(Selective correction on specific underwater color casts)", 
                  font=('Helvetica', 8)).pack(anchor=tk.W)
         
         # Denoise checkbox
@@ -335,12 +368,28 @@ class UnderwaterColorCorrectionGUI:
         if self.original_frame is not None:
             self.update_preview()
     
+    def on_window_resize(self, event):
+        """Called when window is resized - debounced refresh."""
+        # Only handle root window resize events
+        if event.widget != self.root:
+            return
+        
+        # Cancel previous timer if exists
+        if self.resize_timer is not None:
+            self.root.after_cancel(self.resize_timer)
+        
+        # Set new timer to refresh after 200ms of no resize events
+        self.resize_timer = self.root.after(200, self.refresh_preview_display)
+    
     def browse_input(self):
-        """Open file dialog to select input video."""
+        """Open file dialog to select input video or image."""
         filename = filedialog.askopenfilename(
-            title="Select Input Video",
+            title="Select Input Video or Image",
             filetypes=[
+                ("Supported files", "*.mp4 *.jpg *.jpeg *.JPG *.JPEG *.png *.PNG"),
                 ("MP4 files", "*.mp4"),
+                ("JPEG files", "*.jpg *.jpeg *.JPG *.JPEG"),
+                ("PNG files", "*.png *.PNG"),
                 ("All files", "*.*")
             ]
         )
@@ -351,7 +400,11 @@ class UnderwaterColorCorrectionGUI:
             # Auto-suggest output filename
             if not self.output_file.get():
                 input_path = Path(filename)
-                output_path = input_path.parent / f"{input_path.stem}_corrected.mp4"
+                if input_path.suffix.lower() == '.mp4':
+                    output_path = input_path.parent / f"{input_path.stem}_corrected.mp4"
+                else:
+                    # For images, keep the same extension
+                    output_path = input_path.parent / f"{input_path.stem}_corrected{input_path.suffix}"
                 self.output_file.set(str(output_path))
             
             # Clear current preview
@@ -361,22 +414,34 @@ class UnderwaterColorCorrectionGUI:
     
     def browse_output(self):
         """Open file dialog to select output location."""
+        # Determine default extension based on input
+        default_ext = ".mp4"
+        filetypes = [
+            ("Supported files", "*.mp4 *.jpg *.jpeg *.png"),
+            ("MP4 files", "*.mp4"),
+            ("JPEG files", "*.jpg *.jpeg"),
+            ("PNG files", "*.png"),
+            ("All files", "*.*")
+        ]
+        
+        if self.input_file.get():
+            input_ext = Path(self.input_file.get()).suffix.lower()
+            if input_ext in ['.jpg', '.jpeg', '.png']:
+                default_ext = input_ext
+        
         filename = filedialog.asksaveasfilename(
-            title="Save Output Video As",
-            defaultextension=".mp4",
-            filetypes=[
-                ("MP4 files", "*.mp4"),
-                ("All files", "*.*")
-            ]
+            title="Save Output As",
+            defaultextension=default_ext,
+            filetypes=filetypes
         )
         
         if filename:
             self.output_file.set(filename)
     
     def load_preview_frame(self):
-        """Load a frame from the video for preview."""
+        """Load a frame from the video or load the image for preview."""
         if not self.input_file.get():
-            messagebox.showerror("Error", "Please select an input video first")
+            messagebox.showerror("Error", "Please select an input file first")
             return
         
         input_path = Path(self.input_file.get())
@@ -385,35 +450,54 @@ class UnderwaterColorCorrectionGUI:
             return
         
         try:
-            # Open video
-            cap = cv2.VideoCapture(str(input_path))
-            
-            if not cap.isOpened():
-                messagebox.showerror("Error", "Cannot open video file")
-                return
-            
-            # Get total frames and jump to middle
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            middle_frame = total_frames // 2
-            cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
-            
-            # Read frame
-            ret, frame = cap.read()
-            cap.release()
-            
-            if not ret:
-                messagebox.showerror("Error", "Could not read frame from video")
-                return
-            
-            # Store original frame
-            self.original_frame = frame.copy()
+            # Check if it's an image or video
+            if input_path.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                # Load image directly
+                frame = cv2.imread(str(input_path))
+                
+                if frame is None:
+                    messagebox.showerror("Error", "Could not read image file")
+                    return
+                
+                # Store original frame
+                self.original_frame = frame.copy()
+            else:
+                # Load from video
+                cap = cv2.VideoCapture(str(input_path))
+                
+                if not cap.isOpened():
+                    messagebox.showerror("Error", "Cannot open video file")
+                    return
+                
+                # Get total frames and jump to middle
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                middle_frame = total_frames // 2
+                cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
+                
+                # Read frame
+                ret, frame = cap.read()
+                cap.release()
+                
+                if not ret:
+                    messagebox.showerror("Error", "Could not read frame from video")
+                    return
+                
+                # Store original frame
+                self.original_frame = frame.copy()
             
             # Display original and update preview
-            self.display_original()
-            self.update_preview()
+            self.refresh_preview_display()
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load preview:\n{str(e)}")
+    
+    def refresh_preview_display(self):
+        """Refresh both original and corrected preview displays."""
+        if self.original_frame is None:
+            return
+        
+        self.display_original()
+        self.update_preview()
     
     def display_original(self):
         """Display the original frame."""
@@ -452,13 +536,22 @@ class UnderwaterColorCorrectionGUI:
         
         try:
             # Create a temporary corrector with current parameters
-            # We use a dummy path since we're only processing a frame
-            temp_input = self.input_file.get() or "dummy.mp4"
+            # Use dummy paths since we're only processing a frame
+            temp_input = self.input_file.get() if self.input_file.get() else "dummy.mp4"
+            
+            # Check if file exists before creating corrector
+            if not Path(temp_input).exists():
+                # For preview only, create a minimal corrector-like object
+                # We'll manually apply the corrections
+                self.update_preview_manual()
+                return
+            
             corrector = UnderwaterColorCorrector(
                 temp_input,
                 "dummy_output.mp4",
                 self.intensity_var.get(),
-                self.contrast_var.get()
+                self.contrast_var.get(),
+                self.color_mask_var.get()
             )
             
             # Process the frame
@@ -491,6 +584,72 @@ class UnderwaterColorCorrectionGUI:
             
         except Exception as e:
             print(f"Preview update error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def update_preview_manual(self):
+        """Fallback method to update preview without file access."""
+        if self.original_frame is None:
+            return
+        
+        try:
+            # Manually create a simple preview without full corrector
+            frame = self.original_frame.copy()
+            intensity = self.intensity_var.get()
+            contrast = self.contrast_var.get()
+            
+            # Simple color correction without file dependency
+            if intensity > 0.0:
+                # Basic white balance in LAB
+                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                avg_a = np.average(lab[:, :, 1])
+                avg_b = np.average(lab[:, :, 2])
+                lab[:, :, 1] = lab[:, :, 1] - ((avg_a - 128) * (1.1 * intensity))
+                lab[:, :, 2] = lab[:, :, 2] - ((avg_b - 128) * (1.1 * intensity))
+                frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+                
+                # Basic red enhancement
+                b, g, r = cv2.split(frame)
+                r = cv2.convertScaleAbs(r, alpha=1.0 + (0.3 * intensity), beta=10 * intensity)
+                b = cv2.convertScaleAbs(b, alpha=1.0 - (0.1 * intensity), beta=-5 * intensity)
+                g = cv2.convertScaleAbs(g, alpha=1.0 - (0.05 * intensity), beta=-3 * intensity)
+                frame = cv2.merge([b, g, r])
+            
+            if contrast > 0.0:
+                # Basic contrast enhancement
+                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=contrast, tileGridSize=(8, 8))
+                l = clahe.apply(l)
+                frame = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+            
+            # Convert to RGB for display
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Resize to fit canvas
+            canvas_width = self.preview_canvas.winfo_width()
+            canvas_height = self.preview_canvas.winfo_height()
+            
+            if canvas_width <= 1 or canvas_height <= 1:
+                canvas_width = 400
+                canvas_height = 300
+            
+            frame_resized = self.resize_frame(frame_rgb, canvas_width, canvas_height)
+            
+            # Convert to PhotoImage
+            image = Image.fromarray(frame_resized)
+            self.photo_preview = ImageTk.PhotoImage(image)
+            
+            # Display on canvas
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_image(
+                canvas_width // 2, 
+                canvas_height // 2, 
+                image=self.photo_preview
+            )
+            
+        except Exception as e:
+            print(f"Manual preview update error: {e}")
     
     def resize_frame(self, frame, max_width, max_height):
         """Resize frame to fit within max dimensions while maintaining aspect ratio."""
@@ -518,6 +677,7 @@ class UnderwaterColorCorrectionGUI:
         self.intensity_var.set(1.0)
         self.contrast_var.set(2.0)
         self.denoise_var.set(False)
+        self.color_mask_var.set('all')
         self.update_intensity_label(1.0)
         self.update_contrast_label(2.0)
     
@@ -538,8 +698,8 @@ class UnderwaterColorCorrectionGUI:
             messagebox.showerror("Error", "Input file does not exist")
             return False
         
-        if input_path.suffix.lower() != '.mp4':
-            messagebox.showerror("Error", "Input file must be MP4 format")
+        if input_path.suffix.lower() not in ['.mp4', '.jpg', '.jpeg', '.png']:
+            messagebox.showerror("Error", "Input file must be MP4, JPG, JPEG, or PNG format")
             return False
         
         # Check output file
@@ -575,22 +735,29 @@ class UnderwaterColorCorrectionGUI:
         self.root.update_idletasks()
     
     def process_video_thread(self):
-        """Worker thread for video processing."""
+        """Worker thread for video/image processing."""
         try:
             # Create corrector instance
             corrector = UnderwaterColorCorrector(
                 self.input_file.get(),
                 self.output_file.get(),
                 self.intensity_var.get(),
-                self.contrast_var.get()
+                self.contrast_var.get(),
+                self.color_mask_var.get()
             )
             
-            # Process video with progress callback
-            corrector.process_video(
-                apply_denoise=self.denoise_var.get(),
-                show_progress=False,
-                progress_callback=self.update_progress
-            )
+            # Process based on file type
+            if corrector.is_image:
+                corrector.process_image(
+                    show_progress=False,
+                    apply_denoise=self.denoise_var.get()
+                )
+            else:
+                corrector.process_video(
+                    apply_denoise=self.denoise_var.get(),
+                    show_progress=False,
+                    progress_callback=self.update_progress
+                )
             
             # Processing complete
             self.root.after(0, self.processing_complete)
@@ -622,7 +789,7 @@ class UnderwaterColorCorrectionGUI:
         
         messagebox.showinfo(
             "Success",
-            f"Video correction completed successfully!\n\nOutput saved to:\n{self.output_file.get()}"
+            f"Processing completed successfully!\n\nOutput saved to:\n{self.output_file.get()}"
         )
     
     def processing_error(self, error_message):
